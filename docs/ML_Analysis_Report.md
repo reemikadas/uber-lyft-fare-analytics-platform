@@ -65,6 +65,8 @@ measurements are strongly correlated. The final feature set retains one
 representative source measurement or an engineered endpoint feature instead of
 both copies.
 
+![Correlation matrix for quoted price and numeric modeling features](../images/ml_correlation_heatmap.png)
+
 ### Final Numeric Features
 
 - `distance`
@@ -224,6 +226,8 @@ features.
 
 One-hot-encoded feature importances are aggregated back to their original
 fields for interpretation.
+
+![Final Gradient-Boosted Trees model feature importance](../images/ml_feature_importance.png)
 
 | Feature | Importance |
 | --- | ---: |

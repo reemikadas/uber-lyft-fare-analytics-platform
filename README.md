@@ -22,8 +22,6 @@ The source records are **fare quotes**, not completed rides, bookings, revenue, 
 
 ## Architecture
 
-![Uber/Lyft Databricks ELT architecture showing completed Bronze, Silver, Gold, Tableau, and predictive-modeling stages](images/uber_lyft_databricks_tableau_ml_architecture.png)
-
 ```text
 Kaggle source files
     |
@@ -45,6 +43,8 @@ are complete. MLflow experiment tracking and production deployment remain
 possible future extensions.
 
 ## Project Progress
+
+![Uber/Lyft Databricks ELT architecture showing completed Bronze, Silver, Gold, Tableau, and predictive-modeling stages](images/uber_lyft_databricks_tableau_ml_architecture.png)
 
 | Stage | Status | Result |
 |---|---|---|
@@ -201,6 +201,8 @@ Uber_Lyft_Databricks_ELT_Tableau
 |   |-- ML_Analysis_Report.md
 |   `-- Tableau_Insights.md
 |-- images
+|   |-- ml_correlation_heatmap.png
+|   |-- ml_feature_importance.png
 |   |-- uber_lyft_databricks_tableau_ml_architecture.png
 |   `-- uber_lyft_tableau_dashboard.png
 `-- README.md
