@@ -22,6 +22,8 @@ The source records are **fare quotes**, not completed rides, bookings, revenue, 
 
 ## Architecture
 
+![Uber/Lyft Databricks ELT architecture showing completed Bronze, Silver, Gold, Tableau, and predictive-modeling stages](images/uber_lyft_databricks_tableau_ml_architecture.png)
+
 ```text
 Kaggle source files
     |

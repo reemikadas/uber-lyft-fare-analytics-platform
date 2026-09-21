@@ -25,7 +25,8 @@ Gold fare and weather dataset
 Tableau-ready CSV export
 ```
 
-The final dataset contains one row per valid fare quote and supports the Tableau pricing dashboard and the planned predictive fare model.
+The final dataset contains one row per valid fare quote and supports both the
+Tableau pricing dashboard and the completed predictive fare-modeling workflow.
 
 The source records represent queried fare estimates, not completed rides, bookings, revenue, or rider demand.
 
@@ -375,4 +376,4 @@ The completed pipeline provides:
 - Source and destination weather enrichment
 - Reconciled record counts across layers
 - A validated Tableau export
-- A reusable foundation for predictive fare modeling
+- A validated modeling source for the completed GBT fare-prediction workflow
