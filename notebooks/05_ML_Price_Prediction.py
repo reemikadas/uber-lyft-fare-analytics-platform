@@ -1555,3 +1555,173 @@ overall_error_summary_df = (
 )
 
 print("Saved models and results loaded successfully.")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Feature Importance
+
+# COMMAND ----------
+
+from pyspark.sql import functions as F
+
+# Recreate one model-ready record
+gold_table = "rideshare_elt.gold.rides_weather_enriched"
+
+feature_metadata_input_df = (
+    spark.table(gold_table)
+    .drop("price_per_mile", "_gold_created_at")
+    .withColumn(
+        "is_weekend_numeric",
+        F.col("is_weekend").cast("double")
+    )
+    .withColumn(
+        "rain_at_either_location_numeric",
+        F.col("rain_at_either_location").cast("double")
+    )
+    .limit(1)
+)
+
+feature_metadata_output_df = (
+    final_preprocessing_model.transform(feature_metadata_input_df)
+)
+
+# COMMAND ----------
+
+# Extract encoded feature names
+feature_vector_metadata = (
+    feature_metadata_output_df
+    .schema["unscaled_features"]
+    .metadata["ml_attr"]
+)
+
+number_of_model_features = (
+    feature_vector_metadata["num_attrs"]
+)
+
+feature_names = [
+    None
+    for _ in range(number_of_model_features)
+]
+
+for attribute_group in (
+    feature_vector_metadata
+    .get("attrs", {})
+    .values()
+):
+    for attribute in attribute_group:
+        feature_names[attribute["idx"]] = (
+            attribute["name"]
+        )
+
+feature_names = [
+    feature_name
+    if feature_name is not None
+    else f"feature_{feature_index}"
+    for feature_index, feature_name in enumerate(feature_names)
+]
+
+print(f"Feature names extracted: {len(feature_names)}")
+
+# COMMAND ----------
+
+# Match names to GBT importance values
+feature_importance_values = (
+    final_gbt_model
+    .featureImportances
+    .toArray()
+)
+
+assert len(feature_names) == len(feature_importance_values
+    ), "Feature-name and importance counts do not match."
+
+feature_importance_rows = [
+    (
+        feature_index,
+        feature_names[feature_index],
+        float(feature_importance_values[feature_index])
+    )
+    for feature_index in range(len(feature_names))
+]
+
+feature_importance_df = (
+    spark.createDataFrame(
+        feature_importance_rows,
+        [
+            "feature_index",
+            "feature",
+            "importance"
+        ]
+    )
+    .withColumn(
+        "importance",
+        F.round("importance", 6)
+    )
+    .orderBy(F.desc("importance"))
+)
+
+display(feature_importance_df.limit(20))
+
+# COMMAND ----------
+
+# Aggregate one-hot categories into original features
+string_feature_groups = [
+    "name",
+    "source",
+    "destination",
+    "query_day_name_local"
+]
+
+def identify_original_feature(encoded_feature_name):
+    for feature_group in string_feature_groups:
+        if encoded_feature_name.startswith(
+            f"{feature_group}_encoded"
+        ):
+            return feature_group
+
+    if encoded_feature_name.endswith("_numeric"):
+        return encoded_feature_name.replace(
+            "_numeric",
+            ""
+        )
+
+    return encoded_feature_name
+
+
+grouped_importance_rows = [
+    (
+        identify_original_feature(feature_name),
+        float(feature_importance)
+    )
+    for feature_name, feature_importance
+    in zip(
+        feature_names,
+        feature_importance_values
+    )
+]
+
+grouped_feature_importance_df = (
+    spark.createDataFrame(
+        grouped_importance_rows,
+        [
+            "feature",
+            "importance"
+        ]
+    )
+    .groupBy("feature")
+    .agg(
+        F.sum("importance").alias("importance")
+    )
+    .withColumn(
+        "importance_percentage",
+        F.round(
+            F.col("importance") * 100,
+            2
+        )
+    )
+    .orderBy(
+        F.desc("importance")
+    )
+)
+
+display(grouped_feature_importance_df)
