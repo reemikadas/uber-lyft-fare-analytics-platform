@@ -487,3 +487,1071 @@ assert split_row_count == modeling_df.count(), (
 )
 
 print(f"Chronological split validation passed: {split_row_count:,} rows")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Feature Preprocessing
+# MAGIC
+# MAGIC Multi-category string features are indexed and one-hot encoded. Boolean
+# MAGIC features are converted to binary numeric values. The preprocessing pipeline is
+# MAGIC fitted only on the training set to prevent data leakage.
+
+# COMMAND ----------
+
+# Define preprocessing groups
+from pyspark.ml import Pipeline
+from pyspark.ml.feature import (StringIndexer, OneHotEncoder, VectorAssembler)
+from pyspark.ml.functions import vector_to_array
+from pyspark.sql import functions as F
+
+string_categorical_features = [
+    "name",
+    "source",
+    "destination",
+    "query_day_name_local"
+]
+
+boolean_features = [
+    "is_weekend",
+    "rain_at_either_location"
+]
+
+boolean_numeric_features = [
+    f"{column_name}_numeric"
+    for column_name in boolean_features
+]
+
+model_numeric_features = (
+    numeric_features
+    + boolean_numeric_features
+)
+
+print(f"Numeric model features: {len(model_numeric_features)}")
+print(f"String categorical features: {len(string_categorical_features)}")
+
+# COMMAND ----------
+
+def convert_boolean_features(input_df):
+    output_df = input_df
+
+    for column_name in boolean_features:
+        output_df = output_df.withColumn(
+            f"{column_name}_numeric",
+            F.col(column_name).cast("double")
+        )
+    
+    return output_df
+
+train_input_df = convert_boolean_features(train_df)
+validation_input_df = convert_boolean_features(validation_df)
+test_input_df = convert_boolean_features(test_df)
+
+# Verify
+display(
+    train_input_df.select(
+        "is_weekend",
+        "is_weekend_numeric",
+        "rain_at_either_location",
+        "rain_at_either_location_numeric"
+    ).distinct()
+)
+
+# COMMAND ----------
+
+# Create the preprocessing stages
+indexed_feature_columns = [
+    f"{column_name}_index"
+    for column_name in string_categorical_features
+]
+
+encoded_feature_columns = [
+    f"{column_name}_encoded"
+    for column_name in string_categorical_features
+]
+
+categorical_indexers = [
+    StringIndexer(
+        inputCol=column_name,
+        outputCol=f"{column_name}_index",
+        handleInvalid="keep"
+    )
+    for column_name in string_categorical_features
+]
+
+one_hot_encoder = OneHotEncoder(
+    inputCols=indexed_feature_columns,
+    outputCols=encoded_feature_columns,
+    handleInvalid="keep",
+    dropLast=True
+)
+
+feature_assembler = VectorAssembler(
+    inputCols=(model_numeric_features + encoded_feature_columns),
+    outputCol="unscaled_features",
+    handleInvalid="error"
+)
+
+preprocessing_pipeline = Pipeline(
+    stages=(
+        categorical_indexers
+        + [one_hot_encoder, feature_assembler]
+    )
+)
+
+# COMMAND ----------
+
+# Fit only on training data
+preprocessing_model = preprocessing_pipeline.fit(train_input_df)
+
+train_prepared_df = preprocessing_model.transform(train_input_df)
+validation_prepared_df = preprocessing_model.transform(validation_input_df)
+test_prepared_df = preprocessing_model.transform(test_input_df)
+
+# COMMAND ----------
+
+# Validate the prepared datasets
+prepared_split_summary = [
+    (
+        "Train",
+        train_prepared_df.count(),
+        train_df.count()
+    ),
+    (
+        "Validation",
+        validation_prepared_df.count(),
+        validation_df.count()
+    ),
+    (
+        "Test",
+        test_prepared_df.count(),
+        test_df.count()
+    )
+]
+
+for split_name, prepared_rows, original_rows in prepared_split_summary:
+    assert prepared_rows == original_rows, (
+        f"{split_name} row count changed during preprocessing."
+    )
+
+    print(
+        f"{split_name}: {prepared_rows:,} rows retained"
+    )
+
+# COMMAND ----------
+
+feature_vector_size = (
+    train_prepared_df
+    .select(
+        F.size(
+            vector_to_array("unscaled_features")
+        ).alias("feature_count")
+    )
+    .first()["feature_count"]
+)
+
+print(f"Assembled feature count: {feature_vector_size}")
+
+display(train_prepared_df.select(
+    target_column,
+    "unscaled_features"
+    ).limit(5)
+)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Baseline Model
+# MAGIC
+# MAGIC A constant baseline predicts the median training price for every fare quote.
+# MAGIC Subsequent regression models must outperform this baseline on the validation
+# MAGIC period.
+
+# COMMAND ----------
+
+# Create a regression-evaluation function
+from pyspark.ml.evaluation import RegressionEvaluator
+
+def evaluate_regression_predictions(predictions_df, model_name, split_name):
+    metric_results = {"model": model_name,
+                      "split": split_name}
+    
+    for metric_name in ["mae", "rmse", "r2"]:
+        evaluator = RegressionEvaluator(
+            labelCol=target_column,
+            predictionCol="prediction",
+            metricName=metric_name
+        )
+
+        metric_results[metric_name] = float(
+            evaluator.evaluate(predictions_df)
+        )
+
+    return metric_results
+
+# COMMAND ----------
+
+# Calculate the training median
+training_median_price = (
+    train_df
+    .approxQuantile(
+        target_column,
+        [0.5],
+        0.001
+    )[0]
+)
+
+print(f"Training median price: ${training_median_price:,.2f}")
+
+# COMMAND ----------
+
+# Generate baseline predictions
+baseline_train_predictions_df = (
+    train_prepared_df
+    .withColumn(
+        "prediction",
+        F.lit(training_median_price)
+    )
+)
+
+baseline_validation_predictions_df = (
+    validation_prepared_df
+    .withColumn(
+        "prediction",
+        F.lit(training_median_price)
+    )
+)
+
+# COMMAND ----------
+
+# Evaluate the baseline
+baseline_results = [
+    evaluate_regression_predictions(
+        baseline_train_predictions_df,
+        "Training Median Baseline",
+        "Train"
+    ),
+    evaluate_regression_predictions(
+        baseline_validation_predictions_df,
+        "Training Median Baseline",
+        "Validation"
+    )
+]
+
+baseline_results_df = (
+    spark.createDataFrame(baseline_results)
+    .select(
+        "model",
+        "split",
+        F.round("mae", 4).alias("mae"),
+        F.round("rmse", 4).alias("rmse"),
+        F.round("r2", 4).alias("r2")
+    )
+)
+
+display(baseline_results_df)
+
+# COMMAND ----------
+
+training_mean_price = (
+    train_df
+    .agg(
+        F.avg(target_column).alias("mean_price")
+    )
+    .first()["mean_price"]
+)
+
+print(f"Training mean price: ${training_mean_price:,.2f}")
+
+# COMMAND ----------
+
+mean_baseline_train_predictions_df = (
+    train_prepared_df
+    .withColumn(
+        "prediction",
+        F.lit(training_mean_price)
+    )
+)
+
+mean_baseline_validation_predictions_df = (
+    validation_prepared_df
+    .withColumn(
+        "prediction",
+        F.lit(training_mean_price)
+    )
+)
+
+# COMMAND ----------
+
+# Evaluate and combine both baselines
+mean_baseline_results = [
+    evaluate_regression_predictions(
+        mean_baseline_train_predictions_df,
+        "Training Mean Baseline",
+        "Train"
+    ),
+    evaluate_regression_predictions(
+        mean_baseline_validation_predictions_df,
+        "Training Mean Baseline",
+        "Validation"
+    )
+]
+
+all_baseline_results = (
+    baseline_results + mean_baseline_results
+)
+
+all_baseline_results_df = (
+    spark.createDataFrame(all_baseline_results)
+    .select(
+        "model",
+        "split",
+        F.round("mae", 4).alias("mae"),
+        F.round("rmse", 4).alias("rmse"),
+        F.round("r2", 4).alias("r2")
+    )
+    .orderBy("model", "split")
+)
+
+display(all_baseline_results_df)
+
+# COMMAND ----------
+
+from pyspark.ml.feature import StandardScaler
+
+feature_scaler = StandardScaler(
+    inputCol="unscaled_features",
+    outputCol="features",
+    withStd=True,
+    withMean=False
+)
+
+feature_scaler_model = feature_scaler.fit(train_prepared_df)
+
+train_scaled_df = feature_scaler_model.transform(train_prepared_df)
+validation_scaled_df = feature_scaler_model.transform(validation_prepared_df)
+test_scaled_df = feature_scaler_model.transform(test_prepared_df)
+
+print("Feature scaling completed.")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Linear Regression
+# MAGIC
+# MAGIC Linear regression provides an interpretable first model and measures how much
+# MAGIC of the fare variation can be explained through additive relationships between
+# MAGIC the selected predictors and quoted price.
+
+# COMMAND ----------
+
+# Train the initial linear regression
+from pyspark.ml.regression import LinearRegression
+
+linear_regression = LinearRegression(
+    featuresCol="features",
+    labelCol=target_column,
+    predictionCol="prediction",
+    regParam=0.0,
+    elasticNetParam=0.0,
+    maxIter=100,
+    standardization=False
+)
+
+linear_regression_model =linear_regression.fit(train_scaled_df)
+
+print("Linear Regression training completed.")
+
+print(f"Intercept: "
+      f"{linear_regression_model.intercept:,.4f}"
+    )
+
+print(
+    f"Number of Coefficients: "
+    f"{len(linear_regression_model.coefficients)}"
+)
+
+# COMMAND ----------
+
+# Generate predictions
+linear_train_predictions_df = (linear_regression_model.transform(train_scaled_df))
+linear_validation_predictions_df = (linear_regression_model.transform(validation_scaled_df))
+
+# COMMAND ----------
+
+# Evaluate linear regression
+linear_regression_results = [
+    evaluate_regression_predictions(
+        linear_train_predictions_df,
+        "Linear Regression",
+        "Train"
+    ),
+    evaluate_regression_predictions(
+        linear_validation_predictions_df,
+        "Linear Regression",
+        "Validation"
+    )
+]
+
+model_comparison_results = (
+    all_baseline_results +
+    linear_regression_results
+)
+
+model_comparison_df = (
+    spark.createDataFrame(model_comparison_results)
+    .select(
+        "model",
+        "split",
+        F.round("mae", 4).alias("mae"),
+        F.round("rmse", 4).alias("rmse"),
+        F.round("r2", 4).alias("r2")
+    )
+    .orderBy(
+        "split",
+        "rmse"
+    )
+)
+
+display(model_comparison_df)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Linear Regression Performance
+# MAGIC
+# MAGIC Linear regression substantially outperformed both constant-price baselines. On the validation set, it achieved an MAE of **$1.74**, an RMSE of **$2.47**, and an R² of **0.9296**, explaining approximately 93% of quoted-price variation. Training and validation results were nearly identical, indicating strong generalization with no evident overfitting across the chronological split.
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Random Forest
+
+# COMMAND ----------
+
+# Train a Random Forest
+from pyspark.ml.regression import RandomForestRegressor
+
+random_forest = RandomForestRegressor(
+    featuresCol="unscaled_features",
+    labelCol=target_column,
+    predictionCol="prediction",
+    numTrees=50,
+    maxDepth=10,
+    minInstancesPerNode=5,
+    subsamplingRate=0.8,
+    featureSubsetStrategy="sqrt",
+    seed=42
+)
+
+random_forest_model = random_forest.fit(train_prepared_df)
+
+print("Random Forest training completed.")
+
+print(f"Number of trees: {random_forest_model.getNumTrees}")
+
+# COMMAND ----------
+
+# Generate train and validation predictions
+random_forest_train_predictions_df = (random_forest_model.transform(train_prepared_df))
+random_forest_validation_predictions_df = (random_forest_model.transform(validation_prepared_df))
+
+# COMMAND ----------
+
+# Evaluate random forest
+random_forest_results = [
+    evaluate_regression_predictions(
+        random_forest_train_predictions_df,
+        "Random Forest",
+        "Train"
+    ),
+    evaluate_regression_predictions(
+        random_forest_validation_predictions_df,
+        "Random Forest",
+        "Validation"
+    )
+]
+
+model_comparison_results = (
+    all_baseline_results +
+    linear_regression_results +
+    random_forest_results
+)
+
+model_comparison_df = (
+    spark.createDataFrame(model_comparison_results)
+    .select(
+        "model",
+        "split",
+        F.round("mae", 4).alias("mae"),
+        F.round("rmse", 4).alias("rmse"),
+        F.round("r2", 4).alias("r2")
+    )
+    .orderBy(
+        "split",
+        "rmse"
+    )
+)
+
+display(model_comparison_df)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Random Forest Performance
+# MAGIC
+# MAGIC Random Forest substantially outperformed the constant-price baselines but did
+# MAGIC not outperform Linear Regression. It achieved a validation MAE of **$2.59**,
+# MAGIC an RMSE of **$3.37**, and an R² of **0.8685**. Similar training and validation
+# MAGIC results indicate stable generalization, although the current model may be
+# MAGIC underfitting because of its conservative depth and feature-sampling settings.
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Random Forest Experiments
+
+# COMMAND ----------
+
+random_forest_candidates = [
+    {
+        "model_name": "Random Forest - Depth 14",
+        "numTrees": 75,
+        "maxDepth": 14,
+        "minInstancesPerNode": 2,
+        "featureSubsetStrategy": "onethird",
+        "subsamplingRate": 0.9
+    },
+    {
+        "model_name": "Random Forest - Depth 16",
+        "numTrees": 100,
+        "maxDepth": 16,
+        "minInstancesPerNode": 2,
+        "featureSubsetStrategy": "all",
+        "subsamplingRate": 0.8
+    }
+]
+
+# COMMAND ----------
+
+# Train and evaluate each candidate
+tuned_random_forest_results = []
+tuned_random_forest_models = {}
+
+for configuration in random_forest_candidates:
+    model_name = configuration["model_name"]
+
+    estimator = RandomForestRegressor(
+        featuresCol="unscaled_features",
+        labelCol=target_column,
+        predictionCol="prediction",
+        numTrees=configuration["numTrees"],
+        maxDepth=configuration["maxDepth"],
+        minInstancesPerNode=configuration["minInstancesPerNode"],
+        featureSubsetStrategy=configuration["featureSubsetStrategy"],
+        subsamplingRate=configuration["subsamplingRate"],
+        seed=42
+    )
+
+    fitted_model = estimator.fit(train_prepared_df)
+
+    train_predictions_df = fitted_model.transform(train_prepared_df)
+    validation_predictions_df = fitted_model.transform(validation_prepared_df)
+
+    tuned_random_forest_results.extend([
+        evaluate_regression_predictions(
+            train_predictions_df,
+            model_name,
+            "Train"
+        ),
+        evaluate_regression_predictions(
+            validation_predictions_df,
+            model_name,
+            "validation"
+        )
+    ])
+
+    tuned_random_forest_models[model_name] = fitted_model
+
+    print(f"Completed: {model_name}")
+
+# COMMAND ----------
+
+depth_14_random_forest_model = (
+    tuned_random_forest_models[
+        "Random Forest - Depth 14"
+    ]
+)
+
+actual_tree_count = len(
+    depth_14_random_forest_model.trees
+)
+
+print(
+    f"Requested trees: 75\n"
+    f"Trees actually trained: {actual_tree_count}"
+)
+
+# COMMAND ----------
+
+model_comparison_df = (
+    model_comparison_df
+    .withColumn(
+        "split",
+        F.initcap("split")
+    )
+)
+
+# COMMAND ----------
+
+depth_14_comparison_df = (
+    spark.createDataFrame(
+        linear_regression_results
+        + random_forest_results
+        + tuned_random_forest_results
+    )
+    .select(
+        "model",
+        "split",
+        F.round("mae", 4).alias("mae"),
+        F.round("rmse", 4).alias("rmse"),
+        F.round("r2", 4).alias("r2")
+    )
+    .orderBy("split", "rmse")
+)
+
+display(depth_14_comparison_df)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Tuned Random Forest Performance
+# MAGIC
+# MAGIC Increasing Random Forest complexity produced a substantial improvement. The
+# MAGIC depth-14 model achieved a validation MAE of **$1.17**, an RMSE of **$1.75**,
+# MAGIC and an R² of **0.9647**, outperforming Linear Regression across all evaluation
+# MAGIC metrics. Training and validation performance remained closely aligned,
+# MAGIC indicating that the improvement came from capturing useful nonlinear
+# MAGIC relationships rather than evident overfitting. The performance gain came with
+# MAGIC a larger 109 MB model, creating a tradeoff between predictive accuracy and
+# MAGIC model size.
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Gradient-Boosted Trees
+# MAGIC
+# MAGIC Gradient-Boosted Trees may approach or exceed the tuned Random Forest while using fewer, smaller trees.
+
+# COMMAND ----------
+
+from pyspark.ml.regression import GBTRegressor
+
+gradient_boosted_trees = GBTRegressor(
+    featuresCol="unscaled_features",
+    labelCol=target_column,
+    predictionCol="prediction",
+    maxIter=30,
+    maxDepth=8,
+    stepSize=0.05,
+    minInstancesPerNode=5,
+    subsamplingRate=0.8,
+    maxBins=32,
+    seed=42
+)
+
+gradient_boosted_trees_model = (gradient_boosted_trees.fit(train_prepared_df))
+
+print("Gradient-Boosted Trees training completed.")
+print(f"Number of trees: {len(gradient_boosted_trees_model.trees)}")
+
+# COMMAND ----------
+
+# Generate predictions
+gbt_train_predictions_df = (gradient_boosted_trees_model.transform(train_prepared_df))
+gbt_validation_predictions_df = (gradient_boosted_trees_model.transform(validation_prepared_df))
+
+# COMMAND ----------
+
+gradient_boosted_trees_results =[
+    evaluate_regression_predictions(
+        gbt_train_predictions_df,
+        "Gradient-Boosted Trees",
+        "Train"
+    ),
+    evaluate_regression_predictions(
+        gbt_validation_predictions_df,
+        "Gradient-Boosted Trees",
+        "Validation"
+    )
+]
+
+final_validation_comparison_df = (
+    spark.createDataFrame(
+        all_baseline_results
+        + linear_regression_results
+        + random_forest_results
+        + tuned_random_forest_results
+        + gradient_boosted_trees_results
+    )
+    .select(
+        "model",
+        F.initcap("split").alias("split"),
+        F.round("mae", 4).alias("mae"),
+        F.round("rmse", 4).alias("rmse"),
+        F.round("r2", 4).alias("r2")
+    )
+    .orderBy("split", "rmse")
+)
+
+display(final_validation_comparison_df)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Final Model Selection
+# MAGIC
+# MAGIC The tuned depth-14 Random Forest produced the best validation metrics, but its
+# MAGIC advantage over Gradient-Boosted Trees was minimal: less than one cent in MAE,
+# MAGIC approximately three cents in RMSE, and 0.0012 in R². The Random Forest also
+# MAGIC exceeded 109 MB. Gradient-Boosted Trees was therefore selected as the final
+# MAGIC model because it provides nearly equivalent predictive performance with a
+# MAGIC smaller and more practical ensemble.
+
+# COMMAND ----------
+
+# Final training and test evaluation
+development_df = (
+    train_df
+    .unionByName(validation_df)
+)
+
+development_input_df = convert_boolean_features(development_df)
+
+final_test_input_df = convert_boolean_features(test_df)
+
+print(f"Development rows: {development_df.count():,}")
+print(f"Final test rows: {test_df.count():,}")
+
+# COMMAND ----------
+
+# Refit preprocessing without using test data
+final_processing_model = (
+    preprocessing_pipeline.fit(development_input_df)
+)
+
+development_prepared_df = (final_processing_model.transform(development_input_df))
+final_test_prepared_df = (final_processing_model.transform(final_test_input_df))
+
+print("Final preprocessing completed.")
+
+# COMMAND ----------
+
+# Retrain the selected GBT configuration
+final_gbt_estimator = GBTRegressor(
+    featuresCol="unscaled_features",
+    labelCol=target_column,
+    predictionCol="prediction",
+    maxIter=30,
+    maxDepth=8,
+    stepSize=0.05,
+    minInstancesPerNode=5,
+    subsamplingRate=0.8,
+    maxBins=32,
+    seed=42
+)
+
+final_gbt_model = final_gbt_estimator.fit(development_prepared_df)
+
+print("Final GBT model trained.")
+
+# COMMAND ----------
+
+# Evaluate the untouched test period
+final_test_predictions_df = (final_gbt_model.transform(final_test_prepared_df))
+
+final_test_result = evaluate_regression_predictions(
+    final_test_predictions_df,
+    "Final Gradient-Boosted Trees",
+    "Test"
+)
+
+final_test_results_df = (
+    spark.createDataFrame([final_test_result])
+    .select(
+        "model",
+        "split",
+        F.round("mae", 4).alias("mae"),
+        F.round("rmse", 4).alias("rmse"),
+        F.round("r2", 4).alias("r2")
+    )
+)
+
+display(final_test_results_df)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Final Test Performance
+# MAGIC
+# MAGIC The selected Gradient-Boosted Trees model achieved a test MAE of **$1.19**, a
+# MAGIC test RMSE of **$1.81**, and a test R² of **0.9625**. Its test performance was
+# MAGIC close to its validation performance, indicating that the model generalized
+# MAGIC well to the untouched final time period. On average, predicted quoted prices
+# MAGIC differed from actual quoted prices by approximately $1.19.
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Residual Analysis
+
+# COMMAND ----------
+
+# First create the error columns
+final_test_diagnostics_df = (
+    final_test_predictions_df
+    .withColumn(
+        "residual",
+        F.col(target_column) - F.col("prediction")
+    )
+    .withColumn(
+        "absolute_error",
+        F.abs(F.col("residual"))
+    )
+    .withColumn(
+        "squared_error",
+        F.pow(F.col("residual"), 2)
+    )
+)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC Here, a positive residual means the model underpredicted the quoted price; a negative residual means it overpredicted.
+
+# COMMAND ----------
+
+# Overall error distribution
+overall_error_summary_df = (
+    final_test_diagnostics_df
+    .agg(
+        F.count("*").alias("test_quotes"),
+        F.round(F.avg("residual"), 4).alias("average_residual"),
+        F.round(F.min("prediction"), 2).alias("minimum_prediction"),
+        F.round(F.max("prediction"), 2).alias("maximum_prediction"),
+        F.sum((F.col("prediction") < 0).cast("int")).alias("negative_predictions"),
+        F.round(F.expr("percentile_approx(absolute_error, 0.50)"), 4).alias("median_absolute_error"),
+        F.round(F.expr("percentile_approx(absolute_error, 0.90)"), 4).alias("p90_absolute_error"),
+        F.round(F.expr("percentile_approx(absolute_error, 0.95)"), 4).alias("p95_absolute_error"),
+        F.round(F.max("absolute_error"), 4).alias("maximum_absolute_error")
+    )
+)
+
+display(overall_error_summary_df)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Overall Error Distribution
+# MAGIC
+# MAGIC The final model showed almost no systematic bias, with an average residual of
+# MAGIC **$0.01** and no negative price predictions. Half of the test predictions were
+# MAGIC within **$0.81** of the actual quoted price, while 90% were within **$2.58**
+# MAGIC and 95% were within **$3.41**. A maximum absolute error of **$49.65**
+# MAGIC indicates that a small number of unusual or high-priced quotes require
+# MAGIC additional inspection.
+
+# COMMAND ----------
+
+# Error by provider and product
+product_error_summary_df = (
+    final_test_diagnostics_df
+    .groupBy(
+        "cab_type",
+        "name"
+    )
+    .agg(
+        F.count("*").alias("test_quotes"),
+        F.round(F.avg(target_column), 2).alias("average_actual_price"),
+        F.round(F.avg("prediction"), 2).alias("average_predicted_price"),
+        F.round(F.avg("absolute_error"), 4).alias("mae"),
+        F.round(F.sqrt(F.avg("squared_error")), 4).alias("rmse"),
+        F.round(F.avg("residual"), 4).alias("average_residual")
+    )
+    .orderBy(F.desc("mae"))
+)
+
+display(product_error_summary_df)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Product-Level Performance
+# MAGIC
+# MAGIC The final model remained well calibrated across all Uber and Lyft products,
+# MAGIC with average predicted prices within approximately **$0.12** of average actual
+# MAGIC prices. Product-level MAE ranged from **$0.70** for Lyft to **$1.75** for
+# MAGIC UberXL. UberXL had the largest prediction variability, with an RMSE of
+# MAGIC **$2.87**, while no product showed substantial systematic overprediction or
+# MAGIC underprediction. The results indicate that strong overall performance was not
+# MAGIC driven by only one provider or service tier.
+
+# COMMAND ----------
+
+# Inspect the largest individual errors
+largest_test_errors_df = (
+    final_test_diagnostics_df
+    .select(
+        "id",
+        "query_date_local",
+        "cab_type",
+        "name",
+        "source",
+        "destination",
+        "distance",
+        "surge_multiplier",
+        target_column,
+        F.round("prediction", 2).alias("prediction"),
+        F.round("residual", 2).alias("residual"),
+        F.round("absolute_error", 2).alias("absolute_error")
+    )
+    .orderBy(
+        F.desc("absolute_error")
+    )
+    .limit(20)
+)
+
+display(largest_test_errors_df)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Largest Prediction Errors
+# MAGIC
+# MAGIC The largest test errors were concentrated entirely among Uber quotes with a
+# MAGIC recorded surge multiplier of `1.0`. In each case, the actual quoted price was
+# MAGIC substantially higher than the model prediction. The largest error occurred for
+# MAGIC an UberXL quote priced at **$68.50**, compared with a predicted price of
+# MAGIC **$18.85**. Because the source data contains no Uber surge multiplier above
+# MAGIC `1.0`, the model lacks a recorded signal that explains these unusual price
+# MAGIC spikes. These observations were retained because there is no evidence that
+# MAGIC they are invalid, but they represent an important limitation of the available
+# MAGIC features.
+
+# COMMAND ----------
+
+# Create a model-artifact volume
+spark.sql("""
+    CREATE VOLUME IF NOT EXISTS
+    rideshare_elt.gold.ml_artifacts
+""")
+
+artifact_root = (
+    "/Volumes/rideshare_elt/gold/"
+    "ml_artifacts/price_prediction"
+)
+
+# COMMAND ----------
+
+# Save the fitted models
+preprocessing_model_path = (
+    f"{artifact_root}/preprocessing_model"
+)
+
+gbt_model_path = (
+    f"{artifact_root}/final_gbt_model"
+)
+
+final_processing_model.write().overwrite().save(
+    preprocessing_model_path
+)
+
+final_gbt_model.write().overwrite().save(
+    gbt_model_path
+)
+
+print("Models saved successfully.")
+print(f"Preprocessing model: {preprocessing_model_path}")
+print(f"GBT model: {gbt_model_path}")
+
+# COMMAND ----------
+
+# Save the evaluation results
+final_test_results_path = (
+    f"{artifact_root}/results/final_test_metrics"
+)
+
+product_error_results_path = (
+    f"{artifact_root}/results/product_error_metrics"
+)
+
+overall_error_results_path = (
+    f"{artifact_root}/results/overall_error_metrics"
+)
+
+final_test_results_df.write.format(
+    "delta"
+).mode(
+    "overwrite"
+).save(
+    final_test_results_path
+)
+
+product_error_summary_df.write.format(
+    "delta"
+).mode(
+    "overwrite"
+).save(
+    product_error_results_path
+)
+
+overall_error_summary_df.write.format(
+    "delta"
+).mode(
+    "overwrite"
+).save(
+    overall_error_results_path
+)
+
+print("Evaluation results saved successfully.")
+
+# COMMAND ----------
+
+from pyspark.ml import PipelineModel
+from pyspark.ml.regression import GBTRegressionModel
+
+artifact_root = (
+    "/Volumes/rideshare_elt/gold/"
+    "ml_artifacts/price_prediction"
+)
+
+final_preprocessing_model = PipelineModel.load(
+    f"{artifact_root}/preprocessing_model"
+)
+
+final_gbt_model = GBTRegressionModel.load(
+    f"{artifact_root}/final_gbt_model"
+)
+
+final_test_results_df = (
+    spark.read.format("delta")
+    .load(
+        f"{artifact_root}/results/final_test_metrics"
+    )
+)
+
+product_error_summary_df = (
+    spark.read.format("delta")
+    .load(
+        f"{artifact_root}/results/product_error_metrics"
+    )
+)
+
+overall_error_summary_df = (
+    spark.read.format("delta")
+    .load(
+        f"{artifact_root}/results/overall_error_metrics"
+    )
+)
+
+print("Saved models and results loaded successfully.")
